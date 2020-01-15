@@ -13,11 +13,20 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import matplotlib.pyplot as plt
 import os
+import math
 from tensorboardX import SummaryWriter
 import torchvision.utils as vutils
 import seaborn as sns
 import torch.nn.init as init
 import pickle
+from fairseq import (
+    checkpoint_utils, distributed_utils, options, progress_bar, tasks, utils
+)
+import fairseq_local.metrics as fmetrics
+import fairseq.utils as fairsequtils
+from fairseq.data import iterators
+from fairseq.trainer import Trainer
+from fairseq.meters import StopwatchMeter
 
 # Custom Libraries
 import utils
@@ -59,15 +68,26 @@ def main(args, ITE=0):
         traindataset = datasets.ImageNet('../data', train=True, download=True,transform=transform)
         testdataset = datasets.ImageNet('../data', train=False, transform=transform)
         from archs.imagenet import AlexNet, fc1, LeNet5, vgg, resnet
-    # If you want to add extra datasets paste here
+    elif args.dataset == "iwslt14":
+        fairsequtils.import_user_module(args)
+        task = tasks.setup_task(args)
+        valid_subset='valid'
+        task.load_dataset(valid_subset, combine=False, epoch=0)
+        #model = task.build_model(args)
+        #criterion = task.build_criterion(args)
+        #trainer = Trainer(args, task, model, criterion)
+        traindataset = None
+        testdataset = None
+        from archs.iwslt14 import transformer
 
     else:
         print("\nWrong Dataset choice \n")
         exit()
 
-    train_loader = torch.utils.data.DataLoader(traindataset, batch_size=args.batch_size, shuffle=True, num_workers=0,drop_last=False)
-    #train_loader = cycle(train_loader)
-    test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=0,drop_last=True)
+    if traindataset:
+        train_loader = torch.utils.data.DataLoader(traindataset, batch_size=args.batch_size, shuffle=True, num_workers=0,drop_last=False)
+        #train_loader = cycle(train_loader)
+        test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=0,drop_last=True)
     
     # Importing Network Architecture
     global model
@@ -85,7 +105,9 @@ def main(args, ITE=0):
         model = mobilenet.mobilenet_v2().to(device)
     elif args.arch_type == "densenet121":
         model = densenet.densenet121().to(device)   
-    # If you want to add extra model paste here
+    elif args.arch_type == "transformer":
+        model = task.build_model(args)
+   # If you want to add extra model paste here
     else:
         print("\nWrong Model choice\n")
         exit()
@@ -102,8 +124,14 @@ def main(args, ITE=0):
     make_mask(model)
 
     # Optimizer and Loss
-    optimizer = torch.optim.Adam(model.parameters(), weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
+    if args.arch_type != "transformer":
+        optimizer = torch.optim.Adam(model.parameters(), weight_decay=1e-4)
+        criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
+    else:
+        criterion = task.build_criterion(args)
+        trainer = Trainer(args, task, model, criterion)
+        assert(trainer.model)
+        extra_state, epoch_itr = checkpoint_utils.load_checkpoint(args, trainer)
 
     # Layer Looper
     for name, param in model.named_parameters():
@@ -150,7 +178,7 @@ def main(args, ITE=0):
                 step = 0
             else:
                 original_initialization(mask, initial_state_dict)
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lrate, weight_decay=1e-4)
         print(f"\n--- Pruning Level [{ITE}:{_ite}/{ITERATION}]: ---")
 
         # Print the table of Nonzeros in each layer
@@ -162,7 +190,10 @@ def main(args, ITE=0):
 
             # Frequency for Testing
             if iter_ % args.valid_freq == 0:
-                accuracy = test(model, test_loader, criterion)
+                if args.arch_type != "transformer":
+                    accuracy = test(model, test_loader, criterion)
+                else:
+                    accuracy = test_nmt(args, trainer, task, epoch_itr)
 
                 # Save Weights
                 if accuracy > best_accuracy:
@@ -171,7 +202,11 @@ def main(args, ITE=0):
                     torch.save(model,f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pth.tar")
 
             # Training
-            loss = train(model, train_loader, optimizer, criterion)
+            if args.arch_type != "transformer":
+                loss = train(model, train_loader, optimizer, criterion)
+            else:
+                loss = train_nmt(args, trainer, task, epoch_itr)
+
             all_loss[iter_] = loss
             all_accuracy[iter_] = accuracy
             
@@ -253,6 +288,56 @@ def train(model, train_loader, optimizer, criterion):
                 p.grad.data = torch.from_numpy(grad_tensor).to(device)
         optimizer.step()
     return train_loss.item()
+
+# For NMT only
+def train_nmt(args, trainer, task, epoch_itr):
+   # Initialize data iterator
+    itr = epoch_itr.next_epoch_itr(
+        fix_batches_to_gpus=args.fix_batches_to_gpus,
+        shuffle=(epoch_itr.epoch >= args.curriculum),
+    )
+    update_freq = (
+        args.update_freq[epoch_itr.epoch - 1]
+        if epoch_itr.epoch <= len(args.update_freq)
+        else args.update_freq[-1]
+    )
+    itr = iterators.GroupedIterator(itr, update_freq)
+    progress = progress_bar.build_progress_bar(
+        args, itr, epoch_itr.epoch, no_progress_bar='simple',
+    )
+
+    valid_subsets = ['valid']
+    max_update = args.max_update or math.inf
+    for samples in progress:
+        with fmetrics.aggregate('train_inner'):
+            log_output = trainer.train_step(samples)
+            num_updates = trainer.get_num_updates()
+            if log_output is None:
+                continue
+
+            # log mid-epoch stats
+            stats = get_training_stats('train_inner')
+            progress.log(stats, tag='train', step=num_updates)
+
+        if (
+            not args.disable_validation
+            and args.save_interval_updates > 0
+            and num_updates % args.save_interval_updates == 0
+            and num_updates > 0
+        ):
+            valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
+            checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
+    return 0
+
+def test_nmt(args, trainer, task, epoch_itr):
+    return 0
+
+def get_training_stats(stats_key):
+    stats = fmetrics.get_smoothed_values(stats_key)
+    if 'nll_loss' in stats and 'ppl' not in stats:
+        stats['ppl'] = utils.get_perplexity(stats['nll_loss'])
+    #stats['wall'] = round(fmetrics.get_meter('default', 'wall').elapsed_time, 0)
+    return stats
 
 # Function for Testing
 def test(model, test_loader, criterion):
@@ -398,12 +483,9 @@ def weight_init(m):
 
 if __name__=="__main__":
     
-    #from gooey import Gooey
-    #@Gooey      
-    
-    # Arguement Parser
+    # Argument Parser
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lr",default= 1.2e-3, type=float, help="Learning rate")
+    parser.add_argument("--lrate",default= 1.2e-3, type=float, help="Learning rate")
     parser.add_argument("--batch_size", default=60, type=int)
     parser.add_argument("--start_iter", default=0, type=int)
     parser.add_argument("--end_iter", default=100, type=int)
@@ -416,6 +498,64 @@ if __name__=="__main__":
     parser.add_argument("--arch_type", default="fc1", type=str, help="fc1 | lenet5 | alexnet | vgg16 | resnet18 | densenet121")
     parser.add_argument("--prune_percent", default=10, type=int, help="Pruning percent")
     parser.add_argument("--prune_iterations", default=35, type=int, help="Pruning iterations count")
+
+    # For NMT
+    parser.add_argument("--arch", default='transformer_iwslt_de_en', type=str)
+    parser.add_argument("--fp16", default=False)
+    parser.add_argument("--task", default='translation', type=str)
+    parser.add_argument("--left_pad_source", default='True')
+    parser.add_argument("--left_pad_target", default='False')
+    parser.add_argument("--data", default='data-bin/iwslt14.tokenized.de-en', type=str)
+    parser.add_argument("--source_lang", default=None)
+    parser.add_argument("--target_lang", default=None)
+    parser.add_argument("--dataset_impl", default=None)
+    parser.add_argument("--upsample_primary", default=1)
+    parser.add_argument("--max_source_positions", default=1024)
+    parser.add_argument("--max_target_positions", default=1024)
+    parser.add_argument("--load_alignments", default=False)
+    parser.add_argument("--truncate_source", default=False)
+    parser.add_argument("--fast_stat_sync", default=False)
+    parser.add_argument("--distributed_rank", default=0)
+    parser.add_argument("--save_dir", default="checkpoints/transformer")
+    parser.add_argument("--restore_file", default='checkpoint_last.pt')
+    parser.add_argument("--reset_optimizer", default=False)     # FIXME
+    parser.add_argument("--reset_meters", default=False)     # FIXME
+    parser.add_argument("--reset_lr_scheduler", default=False)  # FIXME
+    parser.add_argument("--optimizer_overrides", default='{}')
+    parser.add_argument("--train_subset", default='train')
+    parser.add_argument("--max_tokens", default=4000)
+    parser.add_argument("--max_sentences", default=None)
+    parser.add_argument("--distributed_world_size", default=1)
+    parser.add_argument("--required_batch_size_multiple", default=8)
+    parser.add_argument("--seed", default=1)
+    parser.add_argument("--num_workers", default=1)
+    parser.add_argument("--encoder_layers_to_keep", default=None)
+    parser.add_argument("--decoder_layers_to_keep", default=None)
+    parser.add_argument("--encoder_layerdrop", default=0)
+    parser.add_argument("--decoder_layerdrop", default=0)
+    parser.add_argument("--criterion", default='cross_entropy')
+    parser.add_argument("--use_bmuf", default=False)
+    parser.add_argument("--optimizer", default='nag')
+    parser.add_argument("--lr", default=[0.25])
+    parser.add_argument("--lr_scheduler", default='fixed')
+    parser.add_argument("--lr_shrink", default=0.1)
+    parser.add_argument("--force_anneal", default=None)
+    parser.add_argument("--fix_batches_to_gpus", default=False)
+    parser.add_argument("--curriculum", default=0)
+    parser.add_argument("--update_freq", default=[1])
+    parser.add_argument("--log_format", default=None)
+    parser.add_argument("--no_progress_bar", default=False)
+    parser.add_argument("--log_interval", default=1000)
+    parser.add_argument("--tensorboard_logdir", default='')
+    parser.add_argument("--max_update", default=0)
+    parser.add_argument("--sentence_avg", default=False)
+    parser.add_argument("--clip_norm", default=0.1)
+    parser.add_argument("--empty_cache_freq", default=0)
+    parser.add_argument("--disable_validation", default=False)
+    parser.add_argument("--save_interval_updates", default=0)
+
+    #Namespace(activation_dropout=0.0, activation_fn='relu', adaptive_input=False, adaptive_softmax_cutoff=None, adaptive_softmax_dropout=0, arch='transformer_iwslt_de_en', attention_dropout=0.0, best_checkpoint_metric='loss', bpe=None, bucket_cap_mb=25, clip_norm=0.1, cpu=False, criterion='cross_entropy', cross_self_attention=False, curriculum=0, data='data-bin/iwslt14.tokenized.de-en', dataset_impl=None, ddp_backend='c10d', decoder_attention_heads=4, decoder_embed_dim=512, decoder_embed_path=None, decoder_ffn_embed_dim=1024, decoder_input_dim=512, decoder_layerdrop=0, decoder_layers=6, decoder_layers_to_keep=None, decoder_learned_pos=False, decoder_normalize_before=False, decoder_output_dim=512, device_id=0, disable_validation=False, distributed_backend='nccl', distributed_init_method=None, distributed_no_spawn=False, distributed_port=-1, distributed_rank=0, distributed_world_size=1, dropout=0.2, empty_cache_freq=0, encoder_attention_heads=4, encoder_embed_dim=512, encoder_embed_path=None, encoder_ffn_embed_dim=1024, encoder_layerdrop=0, encoder_layers=6, encoder_layers_to_keep=None, encoder_learned_pos=False, encoder_normalize_before=False, fast_stat_sync=False, find_unused_parameters=False, fix_batches_to_gpus=False, fixed_validation_seed=None, force_anneal=None, fp16=False, fp16_init_scale=128, fp16_scale_tolerance=0.0, fp16_scale_window=None, keep_interval_updates=-1, keep_last_epochs=-1, layer_wise_attention=False, layernorm_embedding=False, lazy_load=False, left_pad_source='True', left_pad_target='False', load_alignments=False, log_format=None, log_interval=1000, lr=[0.25], lr_scheduler='fixed', lr_shrink=0.1, max_epoch=0, max_sentences=None, max_sentences_valid=None, max_source_positions=1024, max_target_positions=1024, max_tokens=4000, max_tokens_valid=4000, max_update=0, maximize_best_checkpoint_metric=False, memory_efficient_fp16=False, min_loss_scale=0.0001, min_lr=-1, momentum=0.99, no_cross_attention=False, no_epoch_checkpoints=False, no_last_checkpoints=False, no_progress_bar=False, no_save=False, no_save_optimizer_state=False, no_scale_embedding=False, no_token_positional_embeddings=False, num_workers=1, optimizer='nag', optimizer_overrides='{}', raw_text=False, required_batch_size_multiple=8, reset_dataloader=False, reset_lr_scheduler=False, reset_meters=False, reset_optimizer=False, restore_file='checkpoint_last.pt', save_dir='checkpoints/fconv', save_interval=1, save_interval_updates=0, seed=1, sentence_avg=False, share_all_embeddings=False, share_decoder_input_output_embed=False, skip_invalid_size_inputs_valid_test=False, source_lang=None, target_lang=None, task='translation', tensorboard_logdir='', threshold_loss_scale=None, tokenizer=None, train_subset='train', truncate_source=False, update_freq=[1], upsample_primary=1, use_bmuf=False, user_dir=None, valid_subset='valid', validate_interval=1, warmup_updates=0, weight_decay=0.0)
+
 
     
     args = parser.parse_args()
