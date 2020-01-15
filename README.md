@@ -1,4 +1,5 @@
-#Sparse model generation
+Sparse model generation
+-----------------------
 We use the approach from the lottery ticket hypothesis paper to progressively sparsify common models. The corresponding code resides in the models/ directory.
 
 To get started, from the models/ directory, pip install -r requirements.txt to download all the required tools. 
