@@ -13,6 +13,9 @@ To generate a sparse version of mobilenet_v2 (trained on cifar100):
 To generate a sparse version of the transformer model:
  python3 main.py --prune_type=lt --arch_type=transformer --dataset=iwslt14 --prune_percent=10 --prune_iterations=35
 
+NCF:
+ python3 main.py --prune_type=lt --arch_type=neumf --dataset=ncf --prune_percent=10 --prune_iterations=35  --batch_size=256 --end_iter=1
+
 The script will save checkpoints in saves/<model_name>/<dataset>/<iter>_model_lt.pth.tar, where iteration 0 corresponds to the dense model and iteration 35 corresponds to the most sparse version of the model.
 The checkpoints can be loaded directly in pytorch by calling torch.load(). .
 

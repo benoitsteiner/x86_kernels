@@ -49,6 +49,9 @@ def main(args, ITE=0):
 
     # Data Loader
     transform=transforms.Compose([transforms.ToTensor(),transforms.Normalize((0.1307,), (0.3081,))])
+
+    num_workers=0
+
     if args.dataset == "mnist":
         traindataset = datasets.MNIST('../data', train=True, download=True,transform=transform)
         testdataset = datasets.MNIST('../data', train=False, transform=transform)
@@ -78,6 +81,7 @@ def main(args, ITE=0):
         train_data, test_data, user_num ,item_num, train_mat = ncf.data_utils.load_all()
         traindataset = ncf.data_utils.NCFData(train_data, item_num, train_mat, args.num_ng, True)
         testdataset = ncf.data_utils.NCFData(test_data, item_num, train_mat, 0, False)
+        num_workers=4
 
     elif args.dataset == "iwslt14":
         fairsequtils.import_user_module(args)
@@ -96,7 +100,7 @@ def main(args, ITE=0):
         exit()
 
     if traindataset:
-        train_loader = torch.utils.data.DataLoader(traindataset, batch_size=args.batch_size, shuffle=True, num_workers=0,drop_last=False)
+        train_loader = torch.utils.data.DataLoader(traindataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers,drop_last=False)
         #train_loader = cycle(train_loader)
         test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=0,drop_last=True)
 
