@@ -11,7 +11,7 @@ To generate a sparse version of mobilenet_v2 (trained on cifar100):
  python3 main.py --prune_type=lt --arch_type=mobilenet --dataset=cifar100 --prune_percent=10 --prune_iterations=35
 
 To generate a sparse version of the transformer model:
- python3 main.py --prune_type=lt --arch_type=transformer --dataset=iwslt14 --prune_percent=10 --prune_iterations=35
+ python3 main.py --prune_type=lt --arch_type=transformer --dataset=iwslt14 --prune_percent=10 --prune_iterations=35 --end_iter=1
 
 NCF:
  python3 main.py --prune_type=lt --arch_type=neumf --dataset=ncf --prune_percent=10 --prune_iterations=35  --batch_size=256 --end_iter=1
