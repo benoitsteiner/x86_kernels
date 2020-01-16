@@ -1,4 +1,5 @@
 # Importing Libraries
+import time
 import argparse
 import copy
 import os
@@ -27,6 +28,10 @@ import fairseq.utils as fairsequtils
 from fairseq.data import iterators
 from fairseq.trainer import Trainer
 from fairseq.meters import StopwatchMeter
+import ncf.data_utils
+import ncf.model
+import ncf.evaluate
+import ncf.config
 
 # Custom Libraries
 import utils
@@ -68,6 +73,12 @@ def main(args, ITE=0):
         traindataset = datasets.ImageNet('../data', train=True, download=True,transform=transform)
         testdataset = datasets.ImageNet('../data', train=False, transform=transform)
         from archs.imagenet import AlexNet, fc1, LeNet5, vgg, resnet
+ 
+    elif args.dataset == "ncf":
+        train_data, test_data, user_num ,item_num, train_mat = ncf.data_utils.load_all()
+        traindataset = ncf.data_utils.NCFData(train_data, item_num, train_mat, args.num_ng, True)
+        testdataset = ncf.data_utils.NCFData(test_data, item_num, train_mat, 0, False)
+
     elif args.dataset == "iwslt14":
         fairsequtils.import_user_module(args)
         task = tasks.setup_task(args)
@@ -88,7 +99,7 @@ def main(args, ITE=0):
         train_loader = torch.utils.data.DataLoader(traindataset, batch_size=args.batch_size, shuffle=True, num_workers=0,drop_last=False)
         #train_loader = cycle(train_loader)
         test_loader = torch.utils.data.DataLoader(testdataset, batch_size=args.batch_size, shuffle=False, num_workers=0,drop_last=True)
-    
+
     # Importing Network Architecture
     global model
     if args.arch_type == "fc1":
@@ -108,9 +119,9 @@ def main(args, ITE=0):
     elif args.arch_type == "transformer":
         model = task.build_model(args)
    # If you want to add extra model paste here
-    else:
-        print("\nWrong Model choice\n")
-        exit()
+    elif args.arch_type == "neumf":
+        model = ncf.model.NCF(user_num, item_num, args.factor_num, args.num_layers,
+                              args.dropout, ncf.config.model, None, None)
 
     # Weight Initialization
     model.apply(weight_init)
@@ -124,7 +135,10 @@ def main(args, ITE=0):
     make_mask(model)
 
     # Optimizer and Loss
-    if args.arch_type != "transformer":
+    if args.arch_type == "neumf":
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.BCEWithLogitsLoss()
+    elif args.arch_type != "transformer":
         optimizer = torch.optim.Adam(model.parameters(), weight_decay=1e-4)
         criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
     else:
@@ -190,7 +204,10 @@ def main(args, ITE=0):
 
             # Frequency for Testing
             if iter_ % args.valid_freq == 0:
-                if args.arch_type != "transformer":
+                if args.arch_type == "neumf":
+                    HR, NDCG = ncf.evaluate.metrics(model, test_loader, args.top_k)
+                    accuracy = HR
+                elif args.arch_type != "transformer":
                     accuracy = test(model, test_loader, criterion)
                 else:
                     accuracy = test_nmt(args, trainer, task, epoch_itr)
@@ -202,7 +219,9 @@ def main(args, ITE=0):
                     torch.save(model,f"{os.getcwd()}/saves/{args.arch_type}/{args.dataset}/{_ite}_model_{args.prune_type}.pth.tar")
 
             # Training
-            if args.arch_type != "transformer":
+            if args.arch_type == "neumf":
+                loss = train_neumf(model, train_loader, test_loader, optimizer, criterion)
+            elif args.arch_type != "transformer":
                 loss = train(model, train_loader, optimizer, criterion)
             else:
                 loss = train_nmt(args, trainer, task, epoch_itr)
@@ -288,6 +307,33 @@ def train(model, train_loader, optimizer, criterion):
                 p.grad.data = torch.from_numpy(grad_tensor).to(device)
         optimizer.step()
     return train_loss.item()
+
+def train_neumf(model, train_loader, test_loader, optimizer, criterion):
+    for epoch in range(args.epochs):
+        model.train() # Enable dropout (if have).
+        start_time = time.time()
+        train_loader.dataset.ng_sample()
+
+        for user, item, label in train_loader:
+                label = label.float()  #.cuda()
+
+                model.zero_grad()
+                prediction = model(user, item)
+                loss = criterion(prediction, label)
+                loss.backward()
+                optimizer.step()
+                # writer.add_scalar('data/loss', loss.item(), count)
+                #count += 1
+
+        model.eval()
+        HR, NDCG = ncf.evaluate.metrics(model, test_loader, args.top_k)
+
+        elapsed_time = time.time() - start_time
+        print("The time elapse of epoch {:03d}".format(epoch) + " is: " +
+                        time.strftime("%H: %M: %S", time.gmtime(elapsed_time)))
+        print("HR: {:.3f}\tNDCG: {:.3f}".format(np.mean(HR), np.mean(NDCG)))
+    return loss
+
 
 # For NMT only
 def train_nmt(args, trainer, task, epoch_itr):
@@ -556,7 +602,37 @@ if __name__=="__main__":
 
     #Namespace(activation_dropout=0.0, activation_fn='relu', adaptive_input=False, adaptive_softmax_cutoff=None, adaptive_softmax_dropout=0, arch='transformer_iwslt_de_en', attention_dropout=0.0, best_checkpoint_metric='loss', bpe=None, bucket_cap_mb=25, clip_norm=0.1, cpu=False, criterion='cross_entropy', cross_self_attention=False, curriculum=0, data='data-bin/iwslt14.tokenized.de-en', dataset_impl=None, ddp_backend='c10d', decoder_attention_heads=4, decoder_embed_dim=512, decoder_embed_path=None, decoder_ffn_embed_dim=1024, decoder_input_dim=512, decoder_layerdrop=0, decoder_layers=6, decoder_layers_to_keep=None, decoder_learned_pos=False, decoder_normalize_before=False, decoder_output_dim=512, device_id=0, disable_validation=False, distributed_backend='nccl', distributed_init_method=None, distributed_no_spawn=False, distributed_port=-1, distributed_rank=0, distributed_world_size=1, dropout=0.2, empty_cache_freq=0, encoder_attention_heads=4, encoder_embed_dim=512, encoder_embed_path=None, encoder_ffn_embed_dim=1024, encoder_layerdrop=0, encoder_layers=6, encoder_layers_to_keep=None, encoder_learned_pos=False, encoder_normalize_before=False, fast_stat_sync=False, find_unused_parameters=False, fix_batches_to_gpus=False, fixed_validation_seed=None, force_anneal=None, fp16=False, fp16_init_scale=128, fp16_scale_tolerance=0.0, fp16_scale_window=None, keep_interval_updates=-1, keep_last_epochs=-1, layer_wise_attention=False, layernorm_embedding=False, lazy_load=False, left_pad_source='True', left_pad_target='False', load_alignments=False, log_format=None, log_interval=1000, lr=[0.25], lr_scheduler='fixed', lr_shrink=0.1, max_epoch=0, max_sentences=None, max_sentences_valid=None, max_source_positions=1024, max_target_positions=1024, max_tokens=4000, max_tokens_valid=4000, max_update=0, maximize_best_checkpoint_metric=False, memory_efficient_fp16=False, min_loss_scale=0.0001, min_lr=-1, momentum=0.99, no_cross_attention=False, no_epoch_checkpoints=False, no_last_checkpoints=False, no_progress_bar=False, no_save=False, no_save_optimizer_state=False, no_scale_embedding=False, no_token_positional_embeddings=False, num_workers=1, optimizer='nag', optimizer_overrides='{}', raw_text=False, required_batch_size_multiple=8, reset_dataloader=False, reset_lr_scheduler=False, reset_meters=False, reset_optimizer=False, restore_file='checkpoint_last.pt', save_dir='checkpoints/fconv', save_interval=1, save_interval_updates=0, seed=1, sentence_avg=False, share_all_embeddings=False, share_decoder_input_output_embed=False, skip_invalid_size_inputs_valid_test=False, source_lang=None, target_lang=None, task='translation', tensorboard_logdir='', threshold_loss_scale=None, tokenizer=None, train_subset='train', truncate_source=False, update_freq=[1], upsample_primary=1, use_bmuf=False, user_dir=None, valid_subset='valid', validate_interval=1, warmup_updates=0, weight_decay=0.0)
 
-
+    # For NCF
+    #parser.add_argument("--lr", type=float, default=0.001, help="learning rate")
+    parser.add_argument("--dropout", type=float, default=0.0, help="dropout rate")
+    #parser.add_argument("--batch_size", type=int, default=256, help="batch size for training")
+    parser.add_argument("--epochs",
+        type=int,
+        default=20,
+        help="training epoches")
+    parser.add_argument("--top_k",
+        type=int,
+        default=10,
+        help="compute metrics@top_k")
+    parser.add_argument("--factor_num",
+        type=int,
+        default=32,
+        help="predictive factors numbers in the model")
+    parser.add_argument("--num_layers",
+        type=int,
+        default=3,
+        help="number of layers in MLP model")
+    parser.add_argument("--num_ng",
+        type=int,
+        default=4,
+        help="sample negative items for training")
+    parser.add_argument("--test_num_ng",
+        type=int,
+        default=99,
+        help="sample part of negative items for testing")
+    parser.add_argument("--out",
+        default=True,
+        help="save model or not")
     
     args = parser.parse_args()
 
