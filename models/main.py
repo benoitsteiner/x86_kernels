@@ -24,9 +24,10 @@ from fairseq import (
     checkpoint_utils, distributed_utils, options, progress_bar, tasks, utils
 )
 import fairseq_local.metrics as fmetrics
+import fairseq_local.trainer as ftrainer
 import fairseq.utils as fairsequtils
 from fairseq.data import iterators
-from fairseq.trainer import Trainer
+#from fairseq.trainer import Trainer
 from fairseq.meters import StopwatchMeter
 import ncf.data_utils
 import ncf.model
@@ -146,7 +147,7 @@ def main(args, ITE=0):
         criterion = nn.CrossEntropyLoss() # Default was F.nll_loss
     else:
         criterion = task.build_criterion(args)
-        trainer = Trainer(args, task, model, criterion)
+        trainer = ftrainer.Trainer(args, task, model, criterion)
         assert(trainer.model)
         extra_state, epoch_itr = checkpoint_utils.load_checkpoint(args, trainer)
 
@@ -314,6 +315,8 @@ def train(model, train_loader, optimizer, criterion):
     return train_loss.item()
 
 def train_neumf(model, train_loader, test_loader, optimizer, criterion):
+    EPS = 1e-6
+    model.train()
     for epoch in range(args.epochs):
         model.train() # Enable dropout (if have).
         start_time = time.time()
@@ -326,6 +329,15 @@ def train_neumf(model, train_loader, test_loader, optimizer, criterion):
                 prediction = model(user, item)
                 loss = criterion(prediction, label)
                 loss.backward()
+
+                # Freezing Pruned weights by making their gradients Zero
+                for name, p in model.named_parameters():
+                    if 'weight' in name:
+                        tensor = p.data
+                        grad_tensor = p.grad.data
+                        grad_tensor = torch.where(tensor < EPS, torch.zeros([]), grad_tensor)
+                        p.grad.data = grad_tensor
+
                 optimizer.step()
                 # writer.add_scalar('data/loss', loss.item(), count)
                 #count += 1
