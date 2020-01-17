@@ -374,7 +374,7 @@ class Trainer(object):
                 if 'weight' in name:
                         tensor = p.data
                         grad_tensor = p.grad.data
-                        grad_tensor = torch.where(tensor < 1e-6, torch.zeros([]), grad_tensor)
+                        grad_tensor = torch.where(tensor < 1e-6, torch.zeros([], device='cuda'), grad_tensor)
                         p.grad.data = grad_tensor
 
             # take an optimization step
@@ -422,8 +422,9 @@ class Trainer(object):
         self.clear_buffered_stats()
         #metrics.log_stop_time("train_wall")
 
-        return logging_output
-
+        #return logging_output
+        return loss
+        
     #@metrics.aggregate("valid")
     def valid_step(self, sample, raise_oom=False):
         """Do forward pass in evaluation mode."""
@@ -471,8 +472,9 @@ class Trainer(object):
         # log validation stats
         logging_output = self._reduce_and_log_stats(logging_outputs, sample_size)
 
-        return logging_output
-
+        #return logging_output
+        return _loss
+        
     def dummy_train_step(self, dummy_batch):
         """Dummy training step for warming caching allocator."""
         self.train_step(dummy_batch, dummy_batch=True)

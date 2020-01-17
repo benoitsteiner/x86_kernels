@@ -215,8 +215,8 @@ def main(args, ITE=0):
                     accuracy = test(model, test_loader, criterion)
                 else:
                     # Hack
-                    accuracy = best_accuracy + 1
-                    #accuracy = test_nmt(args, trainer, task, epoch_itr)
+                    #accuracy = best_accuracy + 1
+                    accuracy = test_nmt(args, trainer, task, epoch_itr)
 
                 # Save Weights
                 if accuracy > best_accuracy:
@@ -379,8 +379,8 @@ def train_nmt(args, trainer, task, epoch_itr):
                 continue
 
             # log mid-epoch stats
-            stats = get_training_stats('train_inner')
-            progress.log(stats, tag='train', step=num_updates)
+            #stats = get_training_stats('train_inner')
+            #progress.log(stats, tag='train', step=num_updates)
 
         if (
             not args.disable_validation
@@ -390,10 +390,35 @@ def train_nmt(args, trainer, task, epoch_itr):
         ):
             valid_losses = validate(args, trainer, task, epoch_itr, valid_subsets)
             checkpoint_utils.save_checkpoint(args, trainer, epoch_itr, valid_losses[0])
-    return 0
+    return log_output
 
 def test_nmt(args, trainer, task, epoch_itr):
-    return 0
+  # Initialize data iterator
+    itr = epoch_itr.next_epoch_itr(
+        fix_batches_to_gpus=args.fix_batches_to_gpus,
+        shuffle=(epoch_itr.epoch >= args.curriculum),
+    )
+    update_freq = (
+        args.update_freq[epoch_itr.epoch - 1]
+        if epoch_itr.epoch <= len(args.update_freq)
+        else args.update_freq[-1]
+    )
+    itr = iterators.GroupedIterator(itr, update_freq)
+    progress = progress_bar.build_progress_bar(
+        args, itr, epoch_itr.epoch, no_progress_bar='simple',
+    )
+
+    valid_subsets = ['valid']
+    max_update = args.max_update or math.inf
+    num_samples = 0
+    for samples in progress:
+        for i, sample in enumerate(samples):
+            total_loss = trainer.valid_step(sample)
+            num_samples += 1
+            #num_updates = trainer.get_num_updates()
+         
+    return num_samples / total_loss
+
 
 def get_training_stats(stats_key):
     stats = fmetrics.get_smoothed_values(stats_key)
